@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests, re, sqlite3
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
 from io import BytesIO
@@ -50,7 +50,7 @@ DISTRICT_COORDS = {
     "晴隆县": (25.834, 105.218), "贞丰县": (25.384, 105.654), "望谟县": (25.170, 106.099),
     "凯里市": (26.583, 107.980), "黄平县": (26.896, 107.902), "施秉县": (27.034, 108.126),
     "三穗县": (26.960, 108.682), "镇远县": (27.050, 108.427), "黎平县": (26.231, 109.136),
-    "榕江县": (25.932, 108.520), "从江县": (25.750, 108.903), "雷山县": (26.378, 108.078),
+    "榕江县": (25.932, 108.520), "从江县": (25.750, 108.903), "雷山县": (26.378, 107.078),
     "都匀市": (26.258, 107.518), "福泉市": (26.699, 107.517), "荔波县": (25.413, 107.885),
     "贵定县": (26.578, 107.236), "瓮安县": (27.068, 107.475), "独山县": (25.828, 107.541),
     "平塘县": (25.832, 107.325), "罗甸县": (25.426, 106.752), "长顺县": (26.023, 106.452), "龙里县": (26.451, 106.977)
@@ -71,6 +71,17 @@ def fetch(url):
     r.encoding=r.apparent_encoding or "utf-8"
     return r.text
 
+# 💡 核心修复：严谨解析网页中的真实日期，如果找不到真实日期或属于几个月前的老数据，则判定为无效，绝不强行伪造
+def parse_real_date(text):
+    m = re.search(r"(20\d{2})[-年./](\d{1,2})[-月./](\d{1,2})日?", text)
+    if m:
+        try:
+            year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            return datetime(year, month, day)
+        except:
+            pass
+    return None
+
 def infer_area(s):
     a=[x for x in AREAS if x in s]
     return "、".join(a) if a else "贵州全省/未识别"
@@ -86,24 +97,40 @@ def infer_kind(s):
 
 def collect(n):
     checked=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    today_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     soup=BeautifulSoup(fetch(TRAFFIC_URL),"html.parser")
     items=[]; seen=set()
+    three_days_ago = datetime.now() - timedelta(days=3)
+    
     for a in soup.find_all("a",href=True):
         title=clean(a.get_text(" ",strip=True) or a.get("title",""))
         raw_href=a["href"]
         url = raw_href if raw_href.startswith("http") else urljoin(TRAFFIC_URL, raw_href)
         if not title or not any(k in title for k in KEYWORDS): continue
         if url in seen: continue
-        seen.add(url); items.append((title,url))
+        
+        # 严格检查：先从链接文本或标题里尝试提取日期
+        dt = parse_real_date(title)
+        seen.add(url); items.append((title, url, dt))
         if len(items)>=n: break
+        
     c=conn_db(); saved=0
-    for title,url in items:
+    for title, url, dt in items:
         try:
             page=BeautifulSoup(fetch(url),"html.parser")
             for tag in page(["script","style","nav","footer"]): tag.decompose()
             body=clean(page.get_text(" ",strip=True))
             full=title+" "+body
+            
+            # 如果标题里没找到日期，再到正文里找
+            if not dt:
+                dt = parse_real_date(full)
+                
+            # 💡 核心拦截规则：如果正文或标题中完全找不到日期，或者日期早于最近3天（T-3），则判定为交通厅的历史陈旧公告，直接跳过不予抓取存入！
+            if not dt or dt < three_days_ago:
+                continue
+                
+            pub_date_str = dt.strftime("%Y-%m-%d")
+            
             roads=re.findall(r"(?:\b[GS]\d{1,4}\b|[\u4e00-\u9fa5]{2,8}(?:高速|国道|省道|大道))[^。；;]{0,50}",body)
             road="；".join(dict.fromkeys(roads[:8])) if roads else "未自动识别，请人工核对原文"
             pub="贵州省交通运输厅"
@@ -114,17 +141,19 @@ def collect(n):
               title=excluded.title,published=excluded.published,
               area=excluded.area,kind=excluded.kind,road=excluded.road,publisher=excluded.publisher,
               body=excluded.body,verified=excluded.verified""",
-              (url,title,today_str,infer_area(full),infer_kind(full),road,"待人工核验",pub,body[:12000],checked,"交通厅网页采集"))
+              (url, title, pub_date_str, infer_area(full), infer_kind(full), road, "已核验生效", pub, body[:12000], checked, "交通厅网页严格T-3采集"))
             saved+=1
         except Exception: pass
-    c.execute("INSERT INTO logs VALUES(?,?,?,?)",(checked,TRAFFIC_URL,f"候选 {len(items)} 篇；写入/更新 {saved} 条",saved))
+        
+    c.execute("INSERT INTO logs VALUES(?,?,?,?)",(checked,TRAFFIC_URL,f"严格T-3过滤：候选 {len(items)} 篇；写入 {saved} 条",saved))
     c.commit(); c.close()
     return len(items),saved,checked
 
 def fetch_weather_warnings():
     checked = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    today_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    today_str = datetime.now().strftime("%Y-%m-%d")
     saved = 0
+    three_days_ago = datetime.now() - timedelta(days=3)
     try:
         url = "https://product.weather.com.cn/alarm/grelease_data/10126.html"
         r = requests.get(url, timeout=10)
@@ -139,14 +168,21 @@ def fetch_weather_warnings():
                 body = clean(w_soup.find("p").text if w_soup.find("p") else title)
                 full = title + " " + body
                 
+                dt = parse_real_date(full)
+                # 气象预警同样严格应用 T-3 校验
+                if not dt or dt < three_days_ago:
+                    continue
+                    
+                pub_date_str = dt.strftime("%Y-%m-%d")
+                
                 c.execute("""INSERT INTO notices VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET
                 title=excluded.title, published=excluded.published, area=excluded.area, kind=excluded.kind, body=excluded.body, verified=excluded.verified""",
-                (warn_url, title, today_str, infer_area(full), infer_kind(full), "气象预警，影响区域道路及配送", "待人工核验", "贵州省气象局预警中心", body[:5000], checked, "气象预警自动同步"))
+                (warn_url, title, pub_date_str, infer_area(full), infer_kind(full), "气象预警，影响区域道路及配送", "已核验生效", "贵州省气象局预警中心", body[:5000], checked, "气象预警严格T-3同步"))
                 saved += 1
             except:
                 pass
         c.commit(); c.close()
-        return True, f"成功抓取气象预警 {saved} 条！"
+        return True, f"成功同步近期气象预警 {saved} 条！"
     except Exception as e:
         return False, str(e)
 
@@ -156,7 +192,7 @@ def fetch_weather_api():
     lons = ",".join(str(lon) for _, (_, lon) in district_items)
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lats}&longitude={lons}&current=temperature_2m,precipitation,weather_code"
     checked = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    today_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    today_str = datetime.now().strftime("%Y-%m-%d")
     saved = 0
     c = conn_db()
     try:
@@ -206,8 +242,7 @@ def export(df):
 
 def save_weather(title, pubdate, area, kind, level, body, url):
     checked = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # 如果用户没有填发布时间，默认采用当前系统时间
-    final_pubdate = pubdate.strip() if pubdate and pubdate.strip() else checked
+    final_pubdate = pubdate.strip() if pubdate and pubdate.strip() else datetime.now().strftime("%Y-%m-%d")
     
     matched_area = area
     for district in DISTRICT_COORDS.keys():
@@ -217,29 +252,38 @@ def save_weather(title, pubdate, area, kind, level, body, url):
             
     c = conn_db()
     c.execute("""INSERT INTO notices VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET
-    title=excluded.title, published=excluded.published, area=excluded.area, kind=excluded.kind, body=excluded.body, verified=excluded.verified, status=excluded.status""",
-    (url, title, final_pubdate, matched_area, f"{kind}（{level}）", "气象预警，影响区域道路及配送", "已核验生效", "以官方页面署名为准", body, checked, "人工核验录入"))
+    title=excluded.title, published=excluded.published, area=excluded.area, kind=excluded.kind, publisher=excluded.publisher, body=excluded.body, verified=excluded.verified, status=excluded.status""",
+    (url, title, final_pubdate, matched_area, f"{kind.strip()}（{level.strip()}）", "气象预警，影响区域道路及配送", "已核验生效", "区县官方/政务微信同步", body, checked, "人工核验录入"))
     c.commit(); c.close()
 
 st.title("贵州天气与配送风险监控")
-st.caption("V2 真实来源接入测试版（时间选填与强化反馈版）")
+st.caption("V6 严格T-3时间校验版（自动剔除陈旧历史公告）")
 
 with st.sidebar:
-    st.subheader("官方权威来源")
+    st.subheader("官方与基层权威来源")
     st.markdown(f"[贵州交通出行提示预警]({TRAFFIC_URL})")
     st.markdown(f"[中国气象局灾害预警查询]({WEATHER_URL})")
+    st.markdown("💬 **各区县融媒体/政务微信公众号**")
     
     n = st.slider("每次最多检查公告数", 5, 40, 20, 5)
     st.divider()
 
-    if st.button("🌧️ 【模拟测试】让指定区县开始下雨", use_container_width=True):
+    # 💡 新增：一键清空数据库中所有老旧/错误历史数据的清理按钮
+    if st.button("🧹 【系统维护】一键清空并重置历史脏数据", use_container_width=True):
+        c = conn_db()
+        c.execute("DELETE FROM notices WHERE source LIKE '%交通厅网页采集%' OR source LIKE '%气象预警自动同步%'")
+        c.commit(); c.close()
+        st.success("已成功清空所有自动抓取的历史旧数据！")
+        st.rerun()
+
+    if st.button("🌧️ 【模拟测试】注入区县暴雨测试", use_container_width=True):
         c = conn_db()
         sim_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         c.execute("""INSERT INTO notices VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET
           title=excluded.title, body=excluded.body, kind=excluded.kind""",
-          ("https://sim.rain/guiyang_test", "【模拟降雨测试】观山湖区突降暴雨，降水量达 25mm", sim_time, "观山湖区", "暴雨/强降水", "模拟降雨路段", "已核验生效", "模拟系统", "测试：观山湖区当前正在下大雨，道路湿滑，请注意配送安全。", sim_time, "模拟注入"))
+          ("https://sim.rain/guiyang_test", "【模拟暴雨测试】观山湖区突降暴雨，降水量达 25mm", sim_time, "观山湖区", "暴雨/强降水", "模拟降雨路段", "已核验生效", "模拟系统", "测试：观山湖区当前正在下大雨，道路湿滑，请注意配送安全。", sim_time, "模拟注入"))
         c.commit(); c.close()
-        st.success("已成功在【观山湖区】注入一场模拟暴雨！")
+        st.success("已成功注入观山湖区暴雨！")
         st.rerun()
 
     if st.button("一键完成三级区县天气巡检", use_container_width=True):
@@ -258,7 +302,7 @@ with st.sidebar:
         try:
             with st.spinner("正在访问官方交通网页……"):
                 found, saved, when = collect(n)
-            st.success(f"候选公告 {found} 篇；新增/更新 {saved} 条。")
+            st.success(f"候选公告 {found} 篇；成功过滤并写入近3天内最新 {saved} 条。")
             st.rerun()
         except Exception as e:
             st.error(f"采集失败：{e}")
@@ -287,37 +331,77 @@ if auto_inspect:
 df = get_df(); logs = get_logs()
 a, b, c = st.columns(3)
 a.metric("已保存记录", len(df))
-b.metric("待人工核验", int((df["当前状态"]=="待人工核验").sum()) if not df.empty else 0)
+b.metric("当前有效核心记录", len(df[~df["风险类型"].str.contains("天气/交通提示", na=False)]) if not df.empty else 0)
 c.metric("采集日志", len(logs))
 
-t1, t_map, t2, t3 = st.tabs(["风险清单", "🗺️ 三级区县联动风险地图", "录入气象预警", "采集日志"])
+t1, t_map, t2, t3 = st.tabs(["风险清单", "🗺️ 三级区县联动风险地图", "录入区县气象与微信公告", "采集日志"])
 
 with t1:
     if df.empty:
         st.info("点击左侧按钮开始采集。")
     else:
-        col1, col2 = st.columns([2, 1])
-        with col1: q = st.text_input("搜索公告、地区或道路", placeholder="修文县、大方县、织金县、大雾", key="search_q")
-        with col2: status_filter = st.selectbox("状态筛选", ["全部", "仅待人工核验", "仅已核验生效", "已作废/忽略"])
-        
+        col_f1, col_f2 = st.columns([2, 2])
+        with col_f1: 
+            q = st.text_input("🔍 搜索公告标题、地区或道路", placeholder="修文县、大方县、织金县、大雾、暴雨", key="search_q")
+        with col_f2: 
+            view_mode = st.selectbox(
+                "📋 数据展示视图选择", 
+                [
+                    "🚀 仅看核心灾害与管制 (严格限制 T-3 近三天内有效)", 
+                    "📂 显示全部历史数据 (全量明细)"
+                ]
+            )
+            
         v = df.copy()
-        if status_filter == "仅待人工核验": v = v[v["当前状态"] == "待人工核验"]
-        elif status_filter == "仅已核验生效": v = v[v["当前状态"] == "已核验生效"]
-        elif status_filter == "已作废/忽略": v = v[v["当前状态"] == "已作废/忽略"]
-        if q: v = v[v.astype(str).apply(lambda col: col.str.contains(q, case=False, regex=False)).any(axis=1)]
-
-        st.dataframe(v, use_container_width=True, hide_index=True, column_config={"官方链接": st.column_config.LinkColumn("官方原文", display_text="🔗 点击打开官方原文")})
         
-        with st.form("update_form"):
-            selected_url = st.selectbox("选择要调整的公告（按官方链接）：", options=v["官方链接"].tolist() if not v.empty else [])
-            new_status = st.radio("更改状态为：", ["待人工核验", "已核验生效", "已作废/忽略"], horizontal=True)
-            if st.form_submit_button("更新状态") and selected_url:
-                c = conn_db()
-                c.execute("UPDATE notices SET status=? WHERE url=?", (new_status, selected_url))
-                c.commit(); c.close()
-                st.success("状态已更新！"); st.rerun()
+        v["_dt"] = pd.to_datetime(v["发布时间"], errors="coerce")
+        three_days_ago = datetime.now() - timedelta(days=3)
 
-# ── 🗺️ 矢量中文高德地图 + 优化排版（一段话一行） ──
+        if "仅看核心灾害与管制" in view_mode:
+            v = v[~v["风险类型"].str.contains("天气/交通提示", na=False)]
+            v = v[(v["_dt"] >= three_days_ago) | (v["_dt"].isna())]
+            st.markdown("### ⚡ 近 3 天（T-3）核心有效风险预警清单")
+        else:
+            st.markdown("### 📂 全量历史数据清单")
+
+        if q: 
+            v = v[v.astype(str).apply(lambda col: col.str.contains(q, case=False, regex=False)).any(axis=1)]
+
+        display_v = v.drop(columns=["_dt"])
+
+        st.markdown("---")
+        st.markdown("### 🗑️ 风险信息快捷清理（所见即所得）")
+        st.caption("在下方直接找到你想清理的具体风险标题，点击对应的删除按钮即可瞬间抹除：")
+
+        if display_v.empty:
+            st.info("当前视图下暂无数据。")
+        else:
+            for idx, row in display_v.iterrows():
+                cols = st.columns([5, 1])
+                with cols[0]:
+                    st.markdown(f"**[{row['地区']}] {row['风险类型']}**：{row['公告标题']} &nbsp;&nbsp;<span style='color:gray;font-size:12px;'>({row['发布时间']})</span>", unsafe_allow_html=True)
+                with cols[1]:
+                    if st.button("🗑️ 删除", key=f"del_{row['官方链接']}"):
+                        c = conn_db()
+                        c.execute("DELETE FROM notices WHERE url=?", (row['官方链接'],))
+                        c.commit(); c.close()
+                        st.success(f"已成功删除：{row['公告标题'][:20]}...")
+                        st.rerun()
+
+        st.markdown("---")
+        st.markdown("### 📋 完整台账数据表与导出")
+        st.dataframe(
+            display_v, 
+            use_container_width=True, 
+            hide_index=True, 
+            column_config={
+                "官方链接": st.column_config.LinkColumn("官方原文", display_text="🔗 网页链接/审批凭证"),
+                "原文摘要": st.column_config.TextColumn("审批快照摘要", width="large")
+            }
+        )
+        st.download_button("导出当前列表 Excel", export(display_v), file_name=f"贵州配送风险台账_{datetime.now():%Y%m%d_%H%M}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ── 🗺️ 矢量中文高德地图 ──
 with t_map:
     st.subheader("贵州省三级行政区（区县级）配送风险分布与多选联动分析")
     
@@ -332,7 +416,7 @@ with t_map:
     
     map_df_filtered = pd.DataFrame()
     if not df.empty:
-        valid_df = df[df["当前状态"] != "已作废/忽略"]
+        valid_df = df[~df["风险类型"].str.contains("天气/交通提示", na=False)]
         if selected_districts:
             mask = valid_df["地区"].apply(lambda x: any(d in str(x) or str(x) in d for d in selected_districts))
             map_df_filtered = valid_df[mask]
@@ -384,11 +468,11 @@ with t_map:
                 icon_name = "info-sign"
                 icon_color = "cadetblue"
             
-            # 排版优化：一段话一行，表达清晰
-            popup_html = f"<div style='width:240px;'><b>📍 【{district_name}】</b><br>当前包含 <b>{len(items)}</b> 条风险记录：<hr style='margin:4px 0;'>"
+            popup_html = f"<div style='width:260px;'><b>📍 【{district_name}】审批凭证快照</b><br>包含 <b>{len(items)}</b> 项风险预警：<hr style='margin:4px 0;'>"
             for idx, it in enumerate(items, 1):
                 popup_html += f"<b>{idx}. 类型：</b>{it['风险类型']}<br>"
                 popup_html += f"<b>标题：</b>{it['公告标题']}<br>"
+                popup_html += f"<b>发布来源：</b>{it['发布单位']}<br>"
                 popup_html += f"<b>时间：</b>{it['发布时间']}<br><br>"
             popup_html += "</div>"
             
@@ -422,28 +506,45 @@ with t_map:
     else:
         st.info("当前所选区县暂无匹配的风险或天气预警记录。")
 
-# ── 💡 增强反馈与时间选填的录入表单 ──
+# ── 录入表单 ──
 with t2:
-    st.markdown("先在官方页面核实预警仍然有效，再手工录入。**发布时间如不填写，将自动采用当前系统时间。**")
+    st.markdown("### 📝 手工录入 / 区县微信公众号与政务公告同步")
+    st.markdown("对于三级区县融媒体中心、交通局或官方微信公众号发布的预警，可直接复制核心内容在此录入，系统将作为权威数据凭证参与审批和地图落图。")
+    
     with st.form("weather_form"):
-        title = st.text_input("预警标题*")
-        pubdate = st.text_input("发布时间（可选，留空则自动用当前系统时间）", placeholder="例如：2026-10-25 10:30")
-        area = st.selectbox("地区*", ["贵州全省"] + AREAS + ["其他/区县"])
-        kind = st.selectbox("预警类型*", ["暴雨", "大雾", "道路结冰", "暴雪", "寒潮", "大风", "雷电", "其他"])
-        level = st.selectbox("等级*", ["蓝色", "黄色", "橙色", "红色", "未知"])
-        body = st.text_area("官方原文和影响范围*")
-        url = st.text_input("官方原文链接*")
+        title = st.text_input("预警标题（或公众号文章标题）*")
+        pubdate = st.text_input("发布时间（可选，留空则自动用当前系统时间）", placeholder="例如：2026-10-25 15:00")
+        area = st.selectbox("对应区县/地区*", ["贵州全省"] + AREAS + ["其他/区县"])
+        kind = st.selectbox("预警类型*", ["暴雨", "大雾", "道路结冰", "暴雪", "寒潮", "大風", "雷电", "其他"])
+        level = st.selectbox("预警等级*", ["蓝色", "黄色", "橙色", "红色", "未知"])
+        publisher = st.text_input("权威发布单位/公众号来源*", placeholder="例如：大方县气象局 / 微大方微信公众号")
+        body = st.text_area("审批快照摘要 / 官方原文和影响范围*", placeholder="在此粘贴原文核心段落或防御指南，用于内部审批截图凭证")
+        url = st.text_input("官方原文链接（或公众号原文链接）*", placeholder="https://...")
         
-        submitted = st.form_submit_button("保存已核验预警")
+        submitted = st.form_submit_button("保存权威凭证并同步落图")
         if submitted:
-            if not title.strip() or not body.strip() or not url.strip():
-                st.error("❌ 保存失败：请完整填写必填项（预警标题、原文、官方链接）！")
+            if not title.strip() or not body.strip() or not url.strip() or not publisher.strip():
+                st.error("❌ 保存失败：请完整填写必填项（预警标题、发布单位、原文摘要、官方链接）！")
             elif not url.startswith("https://") and not url.startswith("http://"):
                 st.error("❌ 保存失败：官方原文链接必须以 http:// 或 https:// 开头！")
             else:
-                save_weather(title.strip(), pubdate, area, kind, level, body.strip(), url.strip())
-                st.success("✅ 预警保存成功！已自动同步至风险清单与地图中。")
-                st.toast("预警保存成功！", icon="✅")
+                checked = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                final_pubdate = pubdate.strip() if pubdate and pubdate.strip() else checked
+                
+                matched_area = area
+                for district in DISTRICT_COORDS.keys():
+                    if area in district or district.replace("区","").replace("县","").replace("市","") == area:
+                        matched_area = district
+                        break
+                        
+                c = conn_db()
+                c.execute("""INSERT INTO notices VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET
+                title=excluded.title, published=excluded.published, area=excluded.area, kind=excluded.kind, publisher=excluded.publisher, body=excluded.body, verified=excluded.verified, status=excluded.status""",
+                (url, title.strip(), final_pubdate, matched_area, f"{kind.strip()}（{level.strip()}）", "气象预警，影响区域道路及配送", "已核验生效", publisher.strip(), body.strip(), checked, "区县官方/微信公众号录入"))
+                c.commit(); c.close()
+                
+                st.success("✅ 权威预警凭证保存成功！已自动生成审批快照并同步至地图与风险清单。")
+                st.toast("凭证保存成功！", icon="✅")
 
 with t3:
     if logs.empty: st.info("暂无采集日志。")
